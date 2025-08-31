@@ -1,5 +1,5 @@
 #!/bin/bash
-# install.sh - LAATSTE SCRIPT OOIT (DE ECHTE LAATSTE FIX)
+# install.sh - FINALE VERSIE MET BEPROEFDE NUXT 3 NGINX CONFIG
 
 set -e
 
@@ -29,7 +29,6 @@ SERVER_IP=$(curl -s ifconfig.me)
 APP_SOURCE_PATH="${APP_BASE_DIR}/source"
 CONFIG_JSON=$(jq -n --arg name "$APP_NAME" --arg user "$DEPLOY_USER" --arg host "$SERVER_IP" --arg domain "$DOMAIN" --arg path "$APP_BASE_DIR" --arg email "$EMAIL" \
 '{servers: [{name: "production", user: $user, host: $host, domain: $domain, path: $path}], email: $email}')
-
 ECOSYSTEM_JS_CONTENT=$(echo "module.exports = {apps:[{name:\"$APP_NAME\",script:\"$APP_SOURCE_PATH/.output/server/index.mjs\",cwd:\"$APP_SOURCE_PATH\",exec_mode:\"cluster\",instances:\"max\"}]};" | base64 -w 0)
 
 DEPLOY_SH_RAW=$(cat << 'EOL'
@@ -44,23 +43,34 @@ APP_PATH=$(jq -r ".servers[] | select(.name==\"$SERVER_NAME\") | .path" deploy.c
 EMAIL=$(jq -r ".email" deploy.config.json)
 SSH_ALIAS="$USER@$HOST"
 echo "🚀 Deploying to '$SERVER_NAME'..."
-rsync -avz --delete --include="package-lock.json" --exclude="node_modules" . "$SSH_ALIAS:$APP_PATH/source/"
+rsync -avz --delete \
+  --include="package-lock.json" \
+  --exclude="node_modules" \
+  --exclude=".git" \
+  --exclude=".uploads" \
+  --exclude="pruvious.db" \
+  . "$SSH_ALIAS:$APP_PATH/source/"
 ssh $SSH_ALIAS << END_SSH
   set -e
   export NVM_DIR="\$HOME/.nvm"
   [ -s "\$NVM_DIR/nvm.sh" ] && \. "\$NVM_DIR/nvm.sh"
+  
+  cd "$APP_PATH/source"
+  npm ci
+  npm run build
+  
   mkdir -p "$APP_PATH/persistent/.uploads"
   touch "$APP_PATH/persistent/pruvious.db"
   ln -sfn "$APP_PATH/persistent/.uploads" "$APP_PATH/source/.uploads"
   ln -sfn "$APP_PATH/persistent/pruvious.db" "$APP_PATH/source/pruvious.db"
-  cd "$APP_PATH/source"
-  npm ci
-  npm run build
+  
   pm2 startOrRestart ecosystem.config.cjs --env production
+  
+  NGINX_CONF_PATH="/etc/nginx/sites-available/$DOMAIN"
   
   if [ ! -f /etc/letsencrypt/live/$DOMAIN/fullchain.pem ]; then
     echo "🔍 First deployment: Setting up Nginx & SSL for $DOMAIN..."
-    sudo tee /etc/nginx/sites-available/$DOMAIN > /dev/null <<'END_NGINX_TEMP'
+    sudo tee \$NGINX_CONF_PATH > /dev/null <<'END_NGINX_TEMP'
 server {
     listen 80;
     server_name $DOMAIN www.$DOMAIN;
@@ -70,49 +80,45 @@ server {
     }
 }
 END_NGINX_TEMP
-    sudo ln -sfn /etc/nginx/sites-available/$DOMAIN /etc/nginx/sites-enabled/
+    sudo ln -sfn \$NGINX_CONF_PATH /etc/nginx/sites-enabled/
     sudo nginx -t && sudo systemctl reload nginx
     sudo certbot --nginx -d $DOMAIN -d www.$DOMAIN --non-interactive --agree-tos -m $EMAIL --redirect
   fi
-
-  echo "⚙️  Updating Nginx for static assets..."
+  
+  # --- HIER IS DE DEFINITIEVE NGINX CONFIGURATIE ---
+  echo "⚙️  Updating Nginx configuration for Nuxt..."
   APP_PUBLIC_PATH="$APP_PATH/source/.output/public"
   
-  NGINX_CONFIG=\$(cat <<EOF
+  sudo tee \$NGINX_CONF_PATH > /dev/null <<'END_NGINX_FINAL'
 server {
-    server_name $DOMAIN www.$DOMAIN;
-    root $APP_PUBLIC_PATH;
-    location /_nuxt {
-        add_header Cache-Control "public, immutable, max-age=31536000";
-        try_files \\\$uri \\\$uri/ =404;
-    }
-    location / {
-        try_files \\\$uri \\\$uri/ @proxy;
-    }
-    location @proxy {
-        proxy_pass http://localhost:3000;
-        proxy_set_header Host \\\$host;
-        proxy_set_header X-Real-IP \\\$remote_addr;
-    }
-    listen 443 ssl;
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    listen 80;
+    server_name \$DOMAIN www.\$DOMAIN;
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name \$DOMAIN www.\$DOMAIN;
+
+    ssl_certificate /etc/letsencrypt/live/\$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/\$DOMAIN/privkey.pem;
     include /etc/letsencrypt/options-ssl-nginx.conf;
     ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
-}
-server {
-    if (\\\$host = www.$DOMAIN) { return 301 https://\\\$host\\\$request_uri; }
-    if (\\\$host = $DOMAIN) { return 301 https://\\\$host\\\$request_uri; }
-    listen 80;
-    server_name $DOMAIN www.$DOMAIN;
-    return 404;
-}
-EOF
-)
-  # --- HIER ZAT DE FOUT: De '\' voor $NGINX_CONFIG is verwijderd ---
-  echo "\$NGINX_CONFIG" | sudo tee /etc/nginx/sites-available/$DOMAIN > /dev/null
-  sudo nginx -t && sudo systemctl reload nginx
 
+    # De proxy naar je Nuxt-app
+    location / {
+        proxy_pass http://localhost:3000;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+END_NGINX_FINAL
+  
+  sudo sed -i "s/\\\$DOMAIN/$DOMAIN/g" \$NGINX_CONF_PATH
+  sudo nginx -t && sudo systemctl reload nginx
+  
 END_SSH
 echo "✅ Deployment to '$SERVER_NAME' was successful!"
 EOL
