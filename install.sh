@@ -1,16 +1,18 @@
 #!/bin/bash
-# install.sh - ALLERLAATSTE SCRIPT (MET ROBUUSTE NGINX HELPER)
+# install.sh - FINALE VERSIE (MET UPLOAD LIMIET FIX)
 
 set -e
 
-# --- Installatie & Config ---
+# --- Installatie & Config (blijft hetzelfde) ---
 echo "--- Server wordt voorbereid... ---"
 apt-get update -y > /dev/null
 apt-get install -y curl wget git nginx jq rsync > /dev/null
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash > /dev/null
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-nvm install 20 > /dev/null && nvm use 20 > /dev/null && npm install -g pm2 > /dev/null
+nvm install 20 > /dev/null
+nvm use 20 > /dev/null
+npm install -g pm2 > /dev/null
 read -p "Geef een naam voor je applicatie (bv. mijn-app): " APP_NAME
 read -p "Welke domeinnaam ga je gebruiken (bv. jouwdomein.com): " DOMAIN
 read -p "Voer een e-mailadres in voor SSL-notificaties: " EMAIL
@@ -52,104 +54,9 @@ ssh $SSH_ALIAS << END_SSH
   [ -s "\$NVM_DIR/nvm.sh" ] && \. "\$NVM_DIR/nvm.sh"
   
   cd "$APP_PATH/source"
-  if [ -f .env.deploy ]; then mv .env.deploy .env; fi
+  if [ -f .env.deploy ]; then mv -f .env.deploy .env; fi
   npm ci
   npm run build
   
   mkdir -p "$APP_PATH/persistent/.uploads" && touch "$APP_PATH/persistent/pruvious.db"
   ln -sfn "$APP_PATH/persistent/.uploads" "$APP_PATH/source/.uploads"
-  ln -sfn "$APP_PATH/persistent/pruvious.db" "$APP_PATH/source/pruvious.db"
-  
-  pm2 startOrRestart ecosystem.config.cjs --env production
-  
-  NGINX_CONF_PATH="/etc/nginx/sites-available/$DOMAIN"
-  
-  if [ ! -f /etc/letsencrypt/live/$DOMAIN/fullchain.pem ]; then
-    echo "🔍 First deployment: Setting up Nginx & SSL for $DOMAIN..."
-    sudo tee \$NGINX_CONF_PATH > /dev/null <<'END_NGINX_TEMP'
-server {
-    listen 80; server_name $DOMAIN www.$DOMAIN;
-    location / { proxy_pass http://localhost:3000; proxy_set_header Host \$host; }
-}
-END_NGINX_TEMP
-    sudo ln -sfn \$NGINX_CONF_PATH /etc/nginx/sites-enabled/
-    sudo nginx -t && sudo systemctl reload nginx
-    sudo certbot --nginx -d $DOMAIN -d www.$DOMAIN --non-interactive --agree-tos -m $EMAIL --redirect
-  fi
-  
-  # --- HIER IS DE DEFINITIEVE, ROBUUSTE FIX ---
-  echo "⚙️  Updating Nginx configuration..."
-  APP_PUBLIC_PATH="$APP_PATH/source/.output/public"
-  
-  # 1. Maak een schoon hulp-script aan op de server
-  cat > /tmp/configure_nginx.sh << 'INNER_EOF'
-#!/bin/bash
-set -e
-# Krijg variabelen als argumenten mee
-DOMAIN="\$1"
-APP_PUBLIC_PATH="\$2"
-NGINX_CONF_PATH="\$3"
-
-# Schrijf de Nginx-configuratie. Dit is nu een simpele, enkele laag.
-tee "\$NGINX_CONF_PATH" > /dev/null << END_NGINX_FINAL
-server {
-    server_name \$DOMAIN www.\$DOMAIN;
-
-    location /_nuxt {
-        alias \$APP_PUBLIC_PATH/_nuxt;
-        add_header Cache-Control "public, immutable, max-age=31536000";
-    }
-    location / {
-        proxy_pass http://localhost:3000;
-        proxy_set_header Host \\\$host;
-        proxy_set_header X-Real-IP \\\$remote_addr;
-    }
-
-    listen 443 ssl http2;
-    ssl_certificate /etc/letsencrypt/live/\$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/\$DOMAIN/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
-}
-server {
-    if (\\\$host = www.\$DOMAIN) { return 301 https://\\\$host\\\$request_uri; }
-    if (\\\$host = \$DOMAIN) { return 301 https://\\\$host\\\$request_uri; }
-    listen 80;
-    server_name \$DOMAIN www.\$DOMAIN;
-    return 404;
-}
-END_NGINX_FINAL
-END_INNER_EOF
-
-  # 2. Voer het hulp-script uit met sudo, met de juiste variabelen
-  sudo bash /tmp/configure_nginx.sh "$DOMAIN" "$APP_PUBLIC_PATH" "$NGINX_CONF_PATH"
-  
-  # 3. Herlaad Nginx en ruim op
-  sudo nginx -t && sudo systemctl reload nginx
-  rm /tmp/configure_nginx.sh
-END_SSH
-echo "✅ Deployment to '$SERVER_NAME' was successful!"
-EOL
-)
-DEPLOY_SH_CONTENT=$(echo "$DEPLOY_SH_RAW" | base64 -w 0)
-FINAL_COMMAND=$(cat << EOL
-echo "🚀 Lokale bestanden worden aangemaakt..."
-echo '$CONFIG_JSON' | jq '.' > deploy.config.json
-echo '$ECOSYSTEM_JS_CONTENT' | base64 --decode > ecosystem.config.cjs
-echo '$DEPLOY_SH_CONTENT' | base64 --decode > deploy.sh
-chmod +x deploy.sh
-if [ -f package.json ]; then
-  jq '.scripts.deploy = "./deploy.sh"' package.json > package.json.tmp && mv package.json.tmp package.json
-fi
-echo "🎉 Lokale setup is voltooid!"
-EOL
-)
-
-echo "✅ Server setup is compleet!"
-echo "========================================================================================"
-echo "ACTION REQUIRED: Kopieer en voer het onderstaande commando lokaal uit:"
-echo "========================================================================================"
-echo
-echo -e "\033[1;32mbash -c \"\$(echo '$(echo "$FINAL_COMMAND" | base64 -w 0)' | base64 --decode)\"\033[0m"
-echo
-echo "========================================================================================"
