@@ -1,18 +1,16 @@
 #!/bin/bash
-# install.sh - COMPLETE VERSIE INCLUSIEF .ENV.DEPLOY
+# install.sh - ALLERLAATSTE SCRIPT (MET ROBUUSTE NGINX HELPER)
 
 set -e
 
-# --- Installatie & Config (blijft hetzelfde) ---
+# --- Installatie & Config ---
 echo "--- Server wordt voorbereid... ---"
 apt-get update -y > /dev/null
 apt-get install -y curl wget git nginx jq rsync > /dev/null
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash > /dev/null
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-nvm install 20 > /dev/null
-nvm use 20 > /dev/null
-npm install -g pm2 > /dev/null
+nvm install 20 > /dev/null && nvm use 20 > /dev/null && npm install -g pm2 > /dev/null
 read -p "Geef een naam voor je applicatie (bv. mijn-app): " APP_NAME
 read -p "Welke domeinnaam ga je gebruiken (bv. jouwdomein.com): " DOMAIN
 read -p "Voer een e-mailadres in voor SSL-notificaties: " EMAIL
@@ -29,6 +27,7 @@ SERVER_IP=$(curl -s ifconfig.me)
 APP_SOURCE_PATH="${APP_BASE_DIR}/source"
 CONFIG_JSON=$(jq -n --arg name "$APP_NAME" --arg user "$DEPLOY_USER" --arg host "$SERVER_IP" --arg domain "$DOMAIN" --arg path "$APP_BASE_DIR" --arg email "$EMAIL" \
 '{servers: [{name: "production", user: $user, host: $host, domain: $domain, path: $path}], email: $email}')
+
 ECOSYSTEM_JS_CONTENT=$(echo "module.exports = {apps:[{name:\"$APP_NAME\",script:\"$APP_SOURCE_PATH/.output/server/index.mjs\",cwd:\"$APP_SOURCE_PATH\",exec_mode:\"cluster\",instances:\"max\"}]};" | base64 -w 0)
 
 DEPLOY_SH_RAW=$(cat << 'EOL'
@@ -43,15 +42,9 @@ APP_PATH=$(jq -r ".servers[] | select(.name==\"$SERVER_NAME\") | .path" deploy.c
 EMAIL=$(jq -r ".email" deploy.config.json)
 SSH_ALIAS="$USER@$HOST"
 echo "🚀 Deploying to '$SERVER_NAME'..."
-
-# --- FIX 1: .env.deploy wordt weer meegestuurd ---
 rsync -avz --delete \
-  --include="package-lock.json" \
-  --include=".env.deploy" \
-  --exclude="node_modules" \
-  --exclude=".git" \
-  --exclude=".uploads" \
-  --exclude="pruvious.db" \
+  --include="package-lock.json" --include=".env.deploy" \
+  --exclude="node_modules" --exclude=".git" --exclude=".uploads" --exclude="pruvious.db" \
   . "$SSH_ALIAS:$APP_PATH/source/"
 ssh $SSH_ALIAS << END_SSH
   set -e
@@ -59,18 +52,11 @@ ssh $SSH_ALIAS << END_SSH
   [ -s "\$NVM_DIR/nvm.sh" ] && \. "\$NVM_DIR/nvm.sh"
   
   cd "$APP_PATH/source"
-
-  # --- FIX 2: .env.deploy wordt hernoemd naar .env ---
-  if [ -f .env.deploy ]; then
-    mv .env.deploy .env
-    echo "✅ .env.deploy is succesvol hernoemd naar .env"
-  fi
-
+  if [ -f .env.deploy ]; then mv .env.deploy .env; fi
   npm ci
   npm run build
   
-  mkdir -p "$APP_PATH/persistent/.uploads"
-  touch "$APP_PATH/persistent/pruvious.db"
+  mkdir -p "$APP_PATH/persistent/.uploads" && touch "$APP_PATH/persistent/pruvious.db"
   ln -sfn "$APP_PATH/persistent/.uploads" "$APP_PATH/source/.uploads"
   ln -sfn "$APP_PATH/persistent/pruvious.db" "$APP_PATH/source/pruvious.db"
   
@@ -82,12 +68,8 @@ ssh $SSH_ALIAS << END_SSH
     echo "🔍 First deployment: Setting up Nginx & SSL for $DOMAIN..."
     sudo tee \$NGINX_CONF_PATH > /dev/null <<'END_NGINX_TEMP'
 server {
-    listen 80;
-    server_name $DOMAIN www.$DOMAIN;
-    location / {
-        proxy_pass http://localhost:3000;
-        proxy_set_header Host \$host;
-    }
+    listen 80; server_name $DOMAIN www.$DOMAIN;
+    location / { proxy_pass http://localhost:3000; proxy_set_header Host \$host; }
 }
 END_NGINX_TEMP
     sudo ln -sfn \$NGINX_CONF_PATH /etc/nginx/sites-enabled/
@@ -95,10 +77,21 @@ END_NGINX_TEMP
     sudo certbot --nginx -d $DOMAIN -d www.$DOMAIN --non-interactive --agree-tos -m $EMAIL --redirect
   fi
   
+  # --- HIER IS DE DEFINITIEVE, ROBUUSTE FIX ---
   echo "⚙️  Updating Nginx configuration..."
   APP_PUBLIC_PATH="$APP_PATH/source/.output/public"
   
-  sudo tee \$NGINX_CONF_PATH > /dev/null <<'END_NGINX_FINAL'
+  # 1. Maak een schoon hulp-script aan op de server
+  cat > /tmp/configure_nginx.sh << 'INNER_EOF'
+#!/bin/bash
+set -e
+# Krijg variabelen als argumenten mee
+DOMAIN="\$1"
+APP_PUBLIC_PATH="\$2"
+NGINX_CONF_PATH="\$3"
+
+# Schrijf de Nginx-configuratie. Dit is nu een simpele, enkele laag.
+tee "\$NGINX_CONF_PATH" > /dev/null << END_NGINX_FINAL
 server {
     server_name \$DOMAIN www.\$DOMAIN;
 
@@ -110,8 +103,6 @@ server {
         proxy_pass http://localhost:3000;
         proxy_set_header Host \\\$host;
         proxy_set_header X-Real-IP \\\$remote_addr;
-        proxy_set_header X-Forwarded-For \\\$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
     }
 
     listen 443 ssl http2;
@@ -128,11 +119,14 @@ server {
     return 404;
 }
 END_NGINX_FINAL
+END_INNER_EOF
+
+  # 2. Voer het hulp-script uit met sudo, met de juiste variabelen
+  sudo bash /tmp/configure_nginx.sh "$DOMAIN" "$APP_PUBLIC_PATH" "$NGINX_CONF_PATH"
   
-  sudo sed -i "s|\\\$APP_PUBLIC_PATH|$APP_PUBLIC_PATH|g" \$NGINX_CONF_PATH
-  sudo sed -i "s/\\\$DOMAIN/$DOMAIN/g" \$NGINX_CONF_PATH
-  
+  # 3. Herlaad Nginx en ruim op
   sudo nginx -t && sudo systemctl reload nginx
+  rm /tmp/configure_nginx.sh
 END_SSH
 echo "✅ Deployment to '$SERVER_NAME' was successful!"
 EOL
