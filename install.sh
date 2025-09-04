@@ -1,5 +1,5 @@
 #!/bin/bash
-# install.sh - FINALE VERSIE MET BEPROEFDE NUXT 3 NGINX CONFIG
+# install.sh - COMPLETE VERSIE INCLUSIEF .ENV.DEPLOY
 
 set -e
 
@@ -43,8 +43,11 @@ APP_PATH=$(jq -r ".servers[] | select(.name==\"$SERVER_NAME\") | .path" deploy.c
 EMAIL=$(jq -r ".email" deploy.config.json)
 SSH_ALIAS="$USER@$HOST"
 echo "🚀 Deploying to '$SERVER_NAME'..."
+
+# --- FIX 1: .env.deploy wordt weer meegestuurd ---
 rsync -avz --delete \
   --include="package-lock.json" \
+  --include=".env.deploy" \
   --exclude="node_modules" \
   --exclude=".git" \
   --exclude=".uploads" \
@@ -56,6 +59,13 @@ ssh $SSH_ALIAS << END_SSH
   [ -s "\$NVM_DIR/nvm.sh" ] && \. "\$NVM_DIR/nvm.sh"
   
   cd "$APP_PATH/source"
+
+  # --- FIX 2: .env.deploy wordt hernoemd naar .env ---
+  if [ -f .env.deploy ]; then
+    mv .env.deploy .env
+    echo "✅ .env.deploy is succesvol hernoemd naar .env"
+  fi
+
   npm ci
   npm run build
   
@@ -85,40 +95,44 @@ END_NGINX_TEMP
     sudo certbot --nginx -d $DOMAIN -d www.$DOMAIN --non-interactive --agree-tos -m $EMAIL --redirect
   fi
   
-  # --- HIER IS DE DEFINITIEVE NGINX CONFIGURATIE ---
-  echo "⚙️  Updating Nginx configuration for Nuxt..."
+  echo "⚙️  Updating Nginx configuration..."
   APP_PUBLIC_PATH="$APP_PATH/source/.output/public"
   
   sudo tee \$NGINX_CONF_PATH > /dev/null <<'END_NGINX_FINAL'
 server {
-    listen 80;
     server_name \$DOMAIN www.\$DOMAIN;
-    return 301 https://\$host\$request_uri;
-}
 
-server {
+    location /_nuxt {
+        alias \$APP_PUBLIC_PATH/_nuxt;
+        add_header Cache-Control "public, immutable, max-age=31536000";
+    }
+    location / {
+        proxy_pass http://localhost:3000;
+        proxy_set_header Host \\\$host;
+        proxy_set_header X-Real-IP \\\$remote_addr;
+        proxy_set_header X-Forwarded-For \\\$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
     listen 443 ssl http2;
-    server_name \$DOMAIN www.\$DOMAIN;
-
     ssl_certificate /etc/letsencrypt/live/\$DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/\$DOMAIN/privkey.pem;
     include /etc/letsencrypt/options-ssl-nginx.conf;
     ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
-
-    # De proxy naar je Nuxt-app
-    location / {
-        proxy_pass http://localhost:3000;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
+}
+server {
+    if (\\\$host = www.\$DOMAIN) { return 301 https://\\\$host\\\$request_uri; }
+    if (\\\$host = \$DOMAIN) { return 301 https://\\\$host\\\$request_uri; }
+    listen 80;
+    server_name \$DOMAIN www.\$DOMAIN;
+    return 404;
 }
 END_NGINX_FINAL
   
+  sudo sed -i "s|\\\$APP_PUBLIC_PATH|$APP_PUBLIC_PATH|g" \$NGINX_CONF_PATH
   sudo sed -i "s/\\\$DOMAIN/$DOMAIN/g" \$NGINX_CONF_PATH
-  sudo nginx -t && sudo systemctl reload nginx
   
+  sudo nginx -t && sudo systemctl reload nginx
 END_SSH
 echo "✅ Deployment to '$SERVER_NAME' was successful!"
 EOL
